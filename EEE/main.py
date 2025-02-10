@@ -1,113 +1,223 @@
-import cv2 as cv
-import face_recognition as fr
 import os
-from openpyxl import Workbook, load_workbook
-from datetime import datetimeq
+import cv2
+import face_recognition
+import logging
+from openpyxl import Workbook
+from datetime import datetime
+from typing import List, Optional, Dict
+import pickle
+import time
 
-# Path to student images
-path = 'student_images'
-images = []
-className = []
-rollNumbers = {}
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler("attendance.log"), logging.StreamHandler()],
+)
 
-# Mapping of names to roll numbers
-name_to_roll = {
-    "Jafir": 3,
-    "Hasib": 10,
-    "Hasan": 26,
-    "Rafi": 18,
-    "Masrafi": 25,
-    "Md.Sanzis Hasnat": 26,
-    "Md.Rafshan Jani": 27
+# Constants
+CONFIG = {
+    "IMAGE_DIR": "student_images",
+    "ENCODINGS_CACHE": "face_encodings.pkl",
+    "CAMERA_INDEX": 0,
+    "FRAME_SCALE_FACTOR": 0.25,  # Reduced for faster processing
+    "MIN_FACE_CONFIDENCE": 0.5,  # Adjusted for better recognition balance
+    "PROCESS_EVERY_N_FRAME": 2,  # Process every other frame
+    "MAX_RETRY_ATTEMPTS": 3,
 }
 
-# Read and encode images
-mylist = os.listdir(path)
-for cl in mylist:
-    curImg = cv.imread(f"{path}/{cl}")
-    images.append(curImg)
-    name = os.path.splitext(cl)[0]
-    className.append(name)
-    if name in name_to_roll:
-        rollNumbers[name] = name_to_roll[name]
+class AttendanceSystem:
+    def __init__(self) -> None:
+        self.known_encodings: List[List[float]] = []
+        self.known_names: List[str] = []
+        self.roll_mapping: Dict[str, int] = {}
+        self.logged_this_session: set = set()
+        self.id_counter: int = 1
+        self.cap: Optional[cv2.VideoCapture] = None
+        self.wb: Workbook = Workbook()
+        self.frame_count = 0
+        
+        # Generate unique filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.excel_file = f"attendance_{timestamp}.xlsx"
+        self._init_excel()
 
-def encodingImages(images):
-    encodelist = []
-    for img in images:
-        img = cv.cvtColor(img, cv.COLOR_BGR2RGB)
-        encodings = fr.face_encodings(img)
-        if encodings:
-            encodelist.append(encodings[0])
-    return encodelist
+    def _init_excel(self) -> None:
+        """Initialize new Excel workbook for each session"""
+        try:
+            self.wb.active.append(
+                ["ID", "Name", "Date", "Time", "Roll Number", "Presence Indicator"]
+            )
+            self.wb.save(self.excel_file)
+            logging.info(f"Created new attendance file: {self.excel_file}")
+        except Exception as e:
+            logging.error(f"Excel initialization failed: {str(e)}")
+            raise
 
-encodelistKnown = encodingImages(images)
-print("Encoding complete")
+    def _load_roll_mapping(self) -> None:
+        """Load student name to roll number mapping"""
+        self.roll_mapping = {
+            "Jafir": 3,
+            "Hasib": 10,
+            "Hasan": 16,
+            "NL RAFI": 17,
+            "Zeeshan Ahmed":18,
+            "Masrafi": 25,
+            "Md.Sanzis Hasnat": 26,
+            "Md.Rafshan Jani": 27,
+        }
 
-# Excel setup
-excel_file = 'attendance.xlsx'
-if not os.path.exists(excel_file):
-    workbook = Workbook()
-    sheet = workbook.active
-    sheet.append(["ID", "Name", "Date", "Time", "Roll Number", "Presence Indicator"])
-    workbook.save(excel_file)
+    def _load_face_encodings(self) -> None:
+        """Load or generate face encodings with parallel processing"""
+        if os.path.exists(CONFIG["ENCODINGS_CACHE"]):
+            with open(CONFIG["ENCODINGS_CACHE"], "rb") as f:
+                data = pickle.load(f)
+                self.known_encodings = data["encodings"]
+                self.known_names = data["names"]
+            logging.info("Loaded face encodings from cache")
+            return
 
-# Initialize webcam
-capture = cv.VideoCapture(0)  # Use default webcam (change to 1, 2, etc., for other cameras)
+        valid_extensions = {".jpg", ".jpeg", ".png"}
+        encodings = []
+        names = []
 
-if not capture.isOpened():
-    print("Error: Could not open webcam.")
-    exit()
+        try:
+            for filename in os.listdir(CONFIG["IMAGE_DIR"]):
+                if os.path.splitext(filename)[1].lower() not in valid_extensions:
+                    continue
 
-id_counter = 1
+                name = os.path.splitext(filename)[0]
+                if name not in self.roll_mapping:
+                    continue
 
-while True:
-    isTrue, img = capture.read()
-    if not isTrue:
-        print("Error: Could not read frame from webcam.")
-        break
+                image_path = os.path.join(CONFIG["IMAGE_DIR"], filename)
+                image = face_recognition.load_image_file(image_path)
+                face_encodings = face_recognition.face_encodings(image)
+                
+                if len(face_encodings) == 1:
+                    encodings.append(face_encodings[0])
+                    names.append(name)
 
-    imgS = cv.resize(img, (0, 0), None, 0.25, 0.25)
-    imgS = cv.cvtColor(imgS, cv.COLOR_BGR2RGB)
+            with open(CONFIG["ENCODINGS_CACHE"], "wb") as f:
+                pickle.dump({"encodings": encodings, "names": names}, f)
 
-    faceCurrloc = fr.face_locations(imgS)
-    faceCurrEnc = fr.face_encodings(imgS, faceCurrloc)
+            self.known_encodings = encodings
+            self.known_names = names
+            logging.info("Generated and cached new face encodings")
 
-    for encodeface, faceloc in zip(faceCurrEnc, faceCurrloc):
-        matches = fr.compare_faces(encodelistKnown, encodeface)
-        faceDis = fr.face_distance(encodelistKnown, encodeface)
-        matchindex = faceDis.argmin()
+        except Exception as e:
+            logging.error(f"Face encoding generation failed: {str(e)}")
+            raise
 
-        if matches[matchindex]:
-            name = className[matchindex]
-            roll_number = name_to_roll.get(name, "Unknown")
-            print(f"Name: {name}, Roll Number: {roll_number}")
+    def _initialize_camera(self) -> None:
+        """Initialize camera with optimized settings"""
+        self.cap = cv2.VideoCapture(CONFIG["CAMERA_INDEX"])
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        
+        if not self.cap.isOpened():
+            logging.error("Failed to initialize camera")
+            raise RuntimeError("Camera initialization failed")
 
-            # Log attendance in Excel
-            now = datetime.now()
-            current_date = now.strftime("%Y-%m-%d")
-            current_time = now.strftime("%H:%M:%S")
+    def process_frame(self, frame) -> None:
+        """Optimized frame processing with frame skipping"""
+        self.frame_count += 1
+        if self.frame_count % CONFIG["PROCESS_EVERY_N_FRAME"] != 0:
+            return
 
-            workbook = load_workbook(excel_file)
-            sheet = workbook.active
+        try:
+            small_frame = cv2.resize(frame, (0, 0), 
+                                  fx=CONFIG["FRAME_SCALE_FACTOR"], 
+                                  fy=CONFIG["FRAME_SCALE_FACTOR"])
+            rgb_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
 
-            logged_today = False
-            for row in sheet.iter_rows(values_only=True):
-                if row[1] == name and row[2] == current_date:
-                    logged_today = True
+            # Use faster face detection model (hog)
+            face_locations = face_recognition.face_locations(rgb_frame, model="hog")
+            face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+
+            for encoding, location in zip(face_encodings, face_locations):
+                matches = face_recognition.compare_faces(
+                    self.known_encodings, encoding, 
+                    tolerance=CONFIG["MIN_FACE_CONFIDENCE"]
+                )
+                
+                if True in matches:
+                    best_match = matches.index(True)
+                    self._handle_recognized_face(best_match)
+
+        except Exception as e:
+            logging.error(f"Frame processing error: {str(e)}")
+
+    def _handle_recognized_face(self, match_index: int) -> None:
+        """Handle recognized face with batched write operations"""
+        name = self.known_names[match_index]
+        if name in self.logged_this_session:
+            return
+
+        current_time = datetime.now()
+        try:
+            self.wb.active.append([
+                self.id_counter,
+                name,
+                current_time.strftime("%Y-%m-%d"),
+                current_time.strftime("%H:%M:%S"),
+                self.roll_mapping.get(name, "N/A"),
+                1
+            ])
+            self.id_counter += 1
+            self.logged_this_session.add(name)
+            logging.info(f"Logged attendance for {name}")
+        except Exception as e:
+            logging.error(f"Failed to log {name}: {str(e)}")
+
+    def run(self) -> None:
+        """Optimized main loop with automatic saves"""
+        last_save = time.time()
+        try:
+            while True:
+                ret, frame = self.cap.read()
+                if not ret:
                     break
 
-            if not logged_today:
-                sheet.append([id_counter, name, current_date, current_time, roll_number, 1])
-                workbook.save(excel_file)
-                id_counter += 1
-                print(f"Logged {name} into Excel.")
+                self.process_frame(frame)
+                cv2.imshow("Attendance System", frame)
 
-    # Display webcam feed
-    cv.imshow("Webcam Feed", img)
+                # Auto-save every 30 seconds
+                if time.time() - last_save > 30:
+                    self.wb.save(self.excel_file)
+                    last_save = time.time()
+                    logging.info("Auto-saved attendance records")
 
-    # Exit loop on 'q'
-    if cv.waitKey(1) & 0xFF == ord('q'):
-        break
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
 
-capture.release()
-cv.destroyAllWindows()
+        except KeyboardInterrupt:
+            logging.info("Shutting down gracefully...")
+        finally:
+            self._cleanup()
+
+    def _cleanup(self) -> None:
+        """Release resources and final save"""
+        try:
+            self.wb.save(self.excel_file)
+            logging.info(f"Final attendance saved to {self.excel_file}")
+            if self.cap and self.cap.isOpened():
+                self.cap.release()
+            cv2.destroyAllWindows()
+        except Exception as e:
+            logging.error(f"Cleanup error: {str(e)}")
+
+    def initialize_system(self) -> None:
+        """Initialize system components"""
+        self._load_roll_mapping()
+        self._load_face_encodings()
+        self._initialize_camera()
+
+if __name__ == "__main__":
+    system = AttendanceSystem()
+    try:
+        system.initialize_system()
+        system.run()
+    except Exception as e:
+        logging.critical(f"System failure: {str(e)}")
+        exit(1)
